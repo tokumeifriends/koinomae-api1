@@ -86,6 +86,21 @@ app.post("/chat", async (req, res) => {
     });
 
     if (!content) {
+  // --- ENV を安全に取得（前後の空白・改行を除去）
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
+
+// デバッグ: サーバが見ているキーの状態を可視化
+app.get("/debug", (_req, res) => {
+  const key = OPENAI_API_KEY;
+  const masked = key ? key.slice(0, 6) + "..." + key.slice(-4) : "";
+  res.json({
+    hasKey: !!key,
+    len: key.length,
+    startsWith_sk: key.startsWith("sk-"),
+    preview: masked,
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini"
+  });
+});
       // 上流失敗時でも必ず非空を返す（UX維持）
       return res.status(502).json({ error: "upstream_failed", reply: "今混んでるみたい。もう一回送ってみて！" });
     }
