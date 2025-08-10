@@ -18,28 +18,46 @@ if (!OPENAI_API_KEY) {
   console.error("ENV OPENAI_API_KEY is missing!");
 }
 
-// ===== OpenAI呼び出し（1回分） =====
-async function openaiChatOnce({ model, messages, max_tokens = 180, temperature = 0.7, response_format }) {
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+// ===== OpenAI呼び出し（Projectキー対応：Responses API 版） =====
+async function openaiChatOnce({ model, messages, max_tokens = 180, temperature = 0.7 }) {
+  const resp = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
+      // sk-proj-... をそのまま使える
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ model, messages, max_tokens, temperature, response_format }),
+    body: JSON.stringify({
+      model,
+      // chat形式の messages をそのまま input に渡せる
+      input: messages,
+      temperature,
+      max_output_tokens: max_tokens
+    }),
   });
 
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    console.error("OpenAI error:", model, resp.status, text);
+    console.error("OpenAI Responses error:", model, resp.status, text);
     return { ok: false, status: resp.status, text };
   }
 
   const data = await resp.json().catch(() => null);
-  const content = data?.choices?.[0]?.message?.content?.trim() || "";
+
+  // Responses API のテキスト取り出し（tools等なし想定）
+  const out = Array.isArray(data?.output) ? data.output : [];
+  const textParts = out
+    .filter(p => p?.type === "message")
+    .flatMap(p => p?.content || [])
+    .filter(c => c?.type === "output_text")
+    .map(c => (c?.text || "").trim())
+    .filter(Boolean);
+
+  const content = (textParts.join("\n")).trim();
+
   if (!content) {
-    console.error("No choices / empty content:", model, JSON.stringify(data || {}));
-    return { ok: false, status: 500, text: "no_choices" };
+    console.error("Responses: empty content", JSON.stringify(data || {}));
+    return { ok: false, status: 500, text: "no_text_in_responses" };
   }
   return { ok: true, content };
 }
