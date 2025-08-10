@@ -1,50 +1,77 @@
-// --- 先頭のENV設定 ---
+// server.js
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
+import dotenv from "dotenv";
+dotenv.config();
+
+const app = express();
+app.use(cors()); // 必要なら { origin: ["https://tokumeifriends.github.io"] } などに制限
+app.use(express.json({ limit: "1mb" }));
+
+// ===== ENV =====
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const PRIMARY_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const FALLBACK_MODEL = "gpt-3.5-turbo-0125";
 
-// OpenAI呼び出し（共通）
-async function openaiChatOnce(model, messages, { max_tokens=180, temperature=0.7 } = {}) {
+if (!OPENAI_API_KEY) {
+  console.error("ENV OPENAI_API_KEY is missing!");
+}
+
+// ===== 共通：OpenAI呼び出し 1回分 =====
+async function openaiChatOnce({ model, messages, max_tokens = 180, temperature = 0.7, response_format }) {
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ model, messages, max_tokens, temperature }),
+    body: JSON.stringify({ model, messages, max_tokens, temperature, response_format }),
   });
 
   if (!resp.ok) {
-    const text = await resp.text().catch(()=>"");
+    const text = await resp.text().catch(() => "");
     console.error("OpenAI error:", model, resp.status, text);
-    return { ok:false, error:{status:resp.status, text} };
+    return { ok: false, status: resp.status, text };
   }
-  const data = await resp.json().catch(()=>null);
-  const reply = data?.choices?.[0]?.message?.content?.trim() || "";
-  if (!reply) {
-    console.error("No choices:", model, JSON.stringify(data||{}));
-    return { ok:false, error:{status:500, text:"no_choices"} };
+
+  const data = await resp.json().catch(() => null);
+  const content = data?.choices?.[0]?.message?.content?.trim() || "";
+
+  if (!content) {
+    console.error("No choices / empty content:", model, JSON.stringify(data || {}));
+    return { ok: false, status: 500, text: "no_choices" };
   }
-  return { ok:true, reply };
+
+  return { ok: true, content };
 }
 
-// モデルを順に試す
-async function tryModels(messages) {
+// ===== モデルを順に試す（フォールバック） =====
+async function tryModels({ messages, max_tokens, temperature, response_format }) {
   const order = [PRIMARY_MODEL, FALLBACK_MODEL];
-  for (const m of order) {
-    const r = await openaiChatOnce(m, messages);
-    if (r.ok) return r.reply;
+  for (const model of order) {
+    const r = await openaiChatOnce({ model, messages, max_tokens, temperature, response_format });
+    if (r.ok) return r.content;
   }
-  return ""; // ここに落ちることがあればネット/課金系
+  return ""; // ここまで来たら上流NG（キー/課金/レートなど）
 }
 
-// /chat 本体
+// ===== Health & Smoke =====
+app.get("/", (_req, res) => res.send("koinomae-api is alive"));
+app.get("/smoke", async (_req, res) => {
+  const msg = [{ role: "user", content: "10〜20字で元気づける一言を日本語で。絵文字1つ。" }];
+  const content = await tryModels({ messages: msg, max_tokens: 60, temperature: 0.7 });
+  res.json({ ok: !!content, modelOrder: [PRIMARY_MODEL, FALLBACK_MODEL], content });
+});
+
+// ===== /chat =====
 app.post("/chat", async (req, res) => {
   try {
     const { messages } = req.body || {};
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "invalid_messages" });
     }
+
     const system = `
 あなたは大学1年の「あかね」。優しく自然体。
 - 日本語。ため口8割・敬語2割
@@ -52,20 +79,25 @@ app.post("/chat", async (req, res) => {
 - 個人情報要求/露骨/オフライン誘導は拒否して代案を提案
     `.trim();
 
-    const reply = await tryModels([{ role:"system", content:system }, ...messages]);
-    if (!reply) {
-      // ここまで来たらOpenAI側が完全にNG。原因表示して非空を返す
-      return res.status(502).json({ error:"upstream_failed", reply:"今ちょっと混んでるみたい。もう一度送ってみて！" });
+    const content = await tryModels({
+      messages: [{ role: "system", content: system }, ...messages],
+      max_tokens: 180,
+      temperature: 0.7,
+    });
+
+    if (!content) {
+      // 上流失敗時でも必ず非空を返す（UX維持）
+      return res.status(502).json({ error: "upstream_failed", reply: "今混んでるみたい。もう一回送ってみて！" });
     }
-    return res.json({ reply });
+
+    return res.json({ reply: content });
   } catch (e) {
     console.error("chat_failed:", e);
-    return res.status(500).json({ error:"chat_failed" });
+    return res.status(500).json({ error: "chat_failed" });
   }
 });
 
-// /score は前の robust 版のままでOK
-// ====== /score ======
+// ===== /score =====
 app.post("/score", async (req, res) => {
   try {
     const { transcript } = req.body || {};
@@ -80,28 +112,18 @@ app.post("/score", async (req, res) => {
  "suggestion":"20〜60字の具体的な改善提案（日本語）"}
     `.trim();
 
-    const result = await openaiChat({
-      model: MODEL,
+    const content = await tryModels({
       messages: [
         { role: "system", content: system },
         { role: "user", content: `会話ログ:\n${transcript}` },
       ],
-      temperature: 0.2,
       max_tokens: 240,
+      temperature: 0.2,
       response_format: { type: "json_object" },
     });
 
-    if (!result.ok) {
-      return res
-        .status(500)
-        .json({ error: "openai_error", detail: result.detail, status: result.status });
-    }
-
-    const data = result.data;
-    const content = data?.choices?.[0]?.message?.content;
     if (!content) {
-      console.error("No choices in score:", JSON.stringify(data));
-      return res.status(500).json({ error: "no_choices", detail: data });
+      return res.status(502).json({ error: "upstream_failed", detail: "empty_content" });
     }
 
     let parsed;
@@ -112,7 +134,6 @@ app.post("/score", async (req, res) => {
       return res.status(500).json({ error: "parse_failed", detail: content });
     }
 
-    // 0-100 → 0-20（加重平均） + 迷いペナルティ
     const s = parsed.scores || {};
     const avg =
       0.22 * (s.initiative || 0) +
