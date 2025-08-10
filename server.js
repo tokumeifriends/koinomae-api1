@@ -72,6 +72,14 @@ app.post("/score", async (req, res) => {
     });
 
     const data = await openaiRes.json();
+
+if (!data.choices || data.choices.length === 0) {
+  console.error("OpenAI API error:", data);
+  return res.status(500).json({ error: "OpenAI API error", detail: data });
+}
+
+const reply = data.choices[0].message.content.trim();
+ 
     const parsed = JSON.parse(data.choices[0].message.content);
 
     // 0-100 → 0-20、迷いペナルティ
