@@ -6,19 +6,19 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-app.use(cors()); // 必要なら { origin: ["https://tokumeifriends.github.io"] } などに制限
+app.use(cors());                 // 必要なら { origin: ["https://tokumeifriends.github.io"] } などに制限
 app.use(express.json({ limit: "1mb" }));
 
 // ===== ENV =====
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const PRIMARY_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const FALLBACK_MODEL = "gpt-3.5-turbo-0125";
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
+const PRIMARY_MODEL  = (process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
+const FALLBACK_MODEL = "gpt-3.5-turbo-0125"; // 使えない場合もあるが一応フォールバック
 
 if (!OPENAI_API_KEY) {
   console.error("ENV OPENAI_API_KEY is missing!");
 }
 
-// ===== 共通：OpenAI呼び出し 1回分 =====
+// ===== OpenAI呼び出し（1回分） =====
 async function openaiChatOnce({ model, messages, max_tokens = 180, temperature = 0.7, response_format }) {
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -37,27 +37,38 @@ async function openaiChatOnce({ model, messages, max_tokens = 180, temperature =
 
   const data = await resp.json().catch(() => null);
   const content = data?.choices?.[0]?.message?.content?.trim() || "";
-
   if (!content) {
     console.error("No choices / empty content:", model, JSON.stringify(data || {}));
     return { ok: false, status: 500, text: "no_choices" };
   }
-
   return { ok: true, content };
 }
 
-// ===== モデルを順に試す（フォールバック） =====
+// ===== モデルを順に試す =====
 async function tryModels({ messages, max_tokens, temperature, response_format }) {
   const order = [PRIMARY_MODEL, FALLBACK_MODEL];
   for (const model of order) {
     const r = await openaiChatOnce({ model, messages, max_tokens, temperature, response_format });
     if (r.ok) return r.content;
   }
-  return ""; // ここまで来たら上流NG（キー/課金/レートなど）
+  return ""; // 上流NG（キー/課金/レート等）
 }
 
-// ===== Health & Smoke =====
+// ===== Health / Debug / Smoke =====
 app.get("/", (_req, res) => res.send("koinomae-api is alive"));
+
+app.get("/debug", (_req, res) => {
+  const key = OPENAI_API_KEY;
+  const masked = key ? key.slice(0, 6) + "..." + key.slice(-4) : "";
+  res.json({
+    hasKey: !!key,
+    len: key.length,
+    startsWith_sk: key.startsWith("sk-"),
+    preview: masked,
+    model: PRIMARY_MODEL
+  });
+});
+
 app.get("/smoke", async (_req, res) => {
   const msg = [{ role: "user", content: "10〜20字で元気づける一言を日本語で。絵文字1つ。" }];
   const content = await tryModels({ messages: msg, max_tokens: 60, temperature: 0.7 });
@@ -86,48 +97,14 @@ app.post("/chat", async (req, res) => {
     });
 
     if (!content) {
-  // --- ENV を安全に取得（前後の空白・改行を除去）
-const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
-
-// デバッグ: サーバが見ているキーの状態を可視化
-app.get("/debug", (_req, res) => {
-  const key = OPENAI_API_KEY;
-  const masked = key ? key.slice(0, 6) + "..." + key.slice(-4) : "";
-  res.json({
-    hasKey: !!key,
-    len: key.length,
-    startsWith_sk: key.startsWith("sk-"),
-    preview: masked,
-    model: process.env.OPENAI_MODEL || "gpt-4o-mini"
-  });
-});
       // 上流失敗時でも必ず非空を返す（UX維持）
       return res.status(502).json({ error: "upstream_failed", reply: "今混んでるみたい。もう一回送ってみて！" });
     }
-
     return res.json({ reply: content });
   } catch (e) {
     console.error("chat_failed:", e);
     return res.status(500).json({ error: "chat_failed" });
   }
-});
-
-// Health check
-app.get("/", (_req, res) => res.send("koinomae-api is alive"));
-
-// Smoke test（OpenAIから実文が返るかを確認）
-app.get("/smoke", async (_req, res) => {
-  // 最小のプロンプトで実文を取得
-  const msg = [{ role: "user", content: "10〜20字で元気づける一言を日本語で。絵文字1つ。" }];
-
-  // あなたの tryModels をそのまま利用
-  const content = await tryModels({
-    messages: msg,
-    max_tokens: 60,
-    temperature: 0.7,
-  });
-
-  res.json({ ok: !!content, modelOrder: [PRIMARY_MODEL, FALLBACK_MODEL], content });
 });
 
 // ===== /score =====
@@ -175,8 +152,8 @@ app.post("/score", async (req, res) => {
       0.18 * (s.clarity || 0) +
       0.18 * (s.pace_balance || 0);
 
-    const raw20 = Math.round(avg / 5);
-    const penalty = Math.min(3, Math.round(((s.hesitation || 0) / 34)));
+    const raw20    = Math.round(avg / 5);
+    const penalty  = Math.min(3, Math.round(((s.hesitation || 0) / 34)));
     const chat_raw20 = Math.max(0, raw20 - penalty);
 
     return res.json({ ...parsed, chat_raw20 });
