@@ -97,6 +97,24 @@ app.post("/chat", async (req, res) => {
   }
 });
 
+// Health check
+app.get("/", (_req, res) => res.send("koinomae-api is alive"));
+
+// Smoke test（OpenAIから実文が返るかを確認）
+app.get("/smoke", async (_req, res) => {
+  // 最小のプロンプトで実文を取得
+  const msg = [{ role: "user", content: "10〜20字で元気づける一言を日本語で。絵文字1つ。" }];
+
+  // あなたの tryModels をそのまま利用
+  const content = await tryModels({
+    messages: msg,
+    max_tokens: 60,
+    temperature: 0.7,
+  });
+
+  res.json({ ok: !!content, modelOrder: [PRIMARY_MODEL, FALLBACK_MODEL], content });
+});
+
 // ===== /score =====
 app.post("/score", async (req, res) => {
   try {
