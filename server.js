@@ -1,4 +1,4 @@
-// server.js
+// server.js (robust)
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -6,24 +6,21 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-app.use(cors());                // 必要なら origin を限定してもOK
-app.use(express.json());
+app.use(cors());                   // 必要なら { origin: ["https://xxx.github.io"] } に絞る
+app.use(express.json({ limit: "1mb" }));
 
-const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // 必要なら gpt-3.5-turbo-0125
+// ====== ENV ======
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
-// 起動時チェック
+const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 if (!OPENAI_API_KEY) {
   console.error("ENV OPENAI_API_KEY is missing!");
 }
 
-// Health check
-app.get("/", (_req, res) => res.send("koinomae-api is alive"));
-
-// 共通: OpenAI呼び出し用（20秒タイムアウト）
-async function openaiChat(body) {
+// ====== Utils ======
+async function openaiChat(body, timeoutMs = 20000) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20000);
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -34,22 +31,32 @@ async function openaiChat(body) {
       body: JSON.stringify(body),
       signal: controller.signal,
     });
+
+    // OpenAI側のHTTPエラー
     if (!resp.ok) {
-      const text = await resp.text();
+      const text = await resp.text().catch(() => "");
       console.error("OpenAI error:", resp.status, text);
-      return { ok: false, error: { status: resp.status, text } };
+      return { ok: false, status: resp.status, detail: text || "(no body)" };
     }
-    const data = await resp.json();
+
+    const data = await resp.json().catch(() => null);
+    if (!data) {
+      console.error("OpenAI: JSON parse failed (empty body)");
+      return { ok: false, status: 500, detail: "json_parse_failed" };
+    }
     return { ok: true, data };
   } catch (err) {
     console.error("OpenAI fetch failed:", err?.name || "", err?.message || err);
-    return { ok: false, error: { status: 500, text: String(err) } };
+    return { ok: false, status: 500, detail: String(err) };
   } finally {
-    clearTimeout(timer);
+    clearTimeout(t);
   }
 }
 
-// 返信生成（LLM）
+// ====== Health check ======
+app.get("/", (_req, res) => res.send("koinomae-api is alive"));
+
+// ====== /chat ======
 app.post("/chat", async (req, res) => {
   try {
     const { messages } = req.body || {};
@@ -60,8 +67,8 @@ app.post("/chat", async (req, res) => {
     const system = `
 あなたは大学1年の「あかね」。優しく自然体。
 - 日本語で返答。ため口8割・敬語2割
-- 10〜50字、要所で質問もする（連続質問しすぎない）
-- 個人情報請求/露骨な表現/オフライン誘導は拒否して別案を提案
+- 10〜50字、相手の感情へ寄り添い、時々だけ質問を返す
+- 個人情報請求/露骨な表現/オフライン誘導は拒否し、穏やかな代案を提案
     `.trim();
 
     const result = await openaiChat({
@@ -72,21 +79,28 @@ app.post("/chat", async (req, res) => {
     });
 
     if (!result.ok) {
-      return res.status(500).json({ error: "openai_error", detail: result.error });
+      // クライアントにも理由を返す
+      return res
+        .status(500)
+        .json({ error: "openai_error", detail: result.detail, status: result.status });
     }
 
     const data = result.data;
-    const reply =
-      data?.choices?.[0]?.message?.content?.trim() ||
-      "うん、なるほど。続き聞かせて？";
+    const reply = data?.choices?.[0]?.message?.content?.trim();
+
+    if (!reply) {
+      console.error("No choices in OpenAI response:", JSON.stringify(data));
+      return res.status(500).json({ error: "no_choices", detail: data });
+    }
+
     return res.json({ reply });
   } catch (e) {
-    console.error(e);
+    console.error("chat_failed:", e);
     return res.status(500).json({ error: "chat_failed" });
   }
 });
 
-// 採点（会話ログ→指標→チャットスコア0-20）
+// ====== /score ======
 app.post("/score", async (req, res) => {
   try {
     const { transcript } = req.body || {};
@@ -95,9 +109,10 @@ app.post("/score", async (req, res) => {
     }
 
     const system = `
-会話から各指標を0-100で採点し、JSONのみ出力。
-{"scores":{"initiative":0-100,"self_disclosure":0-100,"empathy":0-100,"clarity":0-100,"pace_balance":0-100,"hesitation":0-100},"flags":{"safety":true/false},"suggestion":"日本語20-60字"}
-理由や説明は出さない。整数で。
+会話ログをもとに、以下フォーマットのJSONのみを日本語で返す。説明や余分な文字は一切出力しない。
+{"scores":{"initiative":0-100,"self_disclosure":0-100,"empathy":0-100,"clarity":0-100,"pace_balance":0-100,"hesitation":0-100},
+ "flags":{"safety":true/false},
+ "suggestion":"20〜60字の具体的な改善提案（日本語）"}
     `.trim();
 
     const result = await openaiChat({
@@ -107,30 +122,32 @@ app.post("/score", async (req, res) => {
         { role: "user", content: `会話ログ:\n${transcript}` },
       ],
       temperature: 0.2,
-      max_tokens: 200,
+      max_tokens: 240,
       response_format: { type: "json_object" },
     });
 
     if (!result.ok) {
-      return res.status(500).json({ error: "openai_error", detail: result.error });
+      return res
+        .status(500)
+        .json({ error: "openai_error", detail: result.detail, status: result.status });
     }
 
     const data = result.data;
     const content = data?.choices?.[0]?.message?.content;
     if (!content) {
-      console.error("No choices:", JSON.stringify(data));
+      console.error("No choices in score:", JSON.stringify(data));
       return res.status(500).json({ error: "no_choices", detail: data });
     }
 
     let parsed;
     try {
       parsed = JSON.parse(content);
-    } catch (e) {
-      console.error("JSON parse failed:", content);
+    } catch {
+      console.error("score JSON parse failed:", content);
       return res.status(500).json({ error: "parse_failed", detail: content });
     }
 
-    // 0-100 → 0-20、迷いペナルティ
+    // 0-100 → 0-20（加重平均） + 迷いペナルティ
     const s = parsed.scores || {};
     const avg =
       0.22 * (s.initiative || 0) +
@@ -138,13 +155,14 @@ app.post("/score", async (req, res) => {
       0.20 * (s.empathy || 0) +
       0.18 * (s.clarity || 0) +
       0.18 * (s.pace_balance || 0);
+
     const raw20 = Math.round(avg / 5);
     const penalty = Math.min(3, Math.round(((s.hesitation || 0) / 34)));
     const chat_raw20 = Math.max(0, raw20 - penalty);
 
     return res.json({ ...parsed, chat_raw20 });
   } catch (e) {
-    console.error(e);
+    console.error("score_failed:", e);
     return res.status(500).json({ error: "score_failed" });
   }
 });
