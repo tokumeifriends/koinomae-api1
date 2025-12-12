@@ -19,48 +19,42 @@ if (!OPENAI_API_KEY) {
 }
 
 // ===== OpenAI呼び出し（Projectキー対応：Responses API 版） =====
-async function openaiChatOnce({ model, messages, max_tokens = 180, temperature = 0.7 }) {
-  const resp = await fetch("https://api.openai.com/v1/responses", {
+// ===== OpenAI呼び出し（修正版） =====
+async function openaiChatOnce({ model, messages, max_tokens = 180, temperature = 0.7, response_format }) {
+  // ★宛先を正しいものに変更
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      // sk-proj-... をそのまま使える
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model,
-      // chat形式の messages をそのまま input に渡せる
-      input: messages,
+      messages, // ★ input ではなく messages が正解
       temperature,
-      max_output_tokens: max_tokens
+      max_tokens, // ★ max_output_tokens ではなく max_tokens が正解
+      response_format // ★ JSONモードを使うために必要
     }),
   });
 
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    console.error("OpenAI Responses error:", model, resp.status, text);
+    console.error("OpenAI Error:", model, resp.status, text);
     return { ok: false, status: resp.status, text };
   }
 
   const data = await resp.json().catch(() => null);
 
-  // Responses API のテキスト取り出し（tools等なし想定）
-  const out = Array.isArray(data?.output) ? data.output : [];
-  const textParts = out
-    .filter(p => p?.type === "message")
-    .flatMap(p => p?.content || [])
-    .filter(c => c?.type === "output_text")
-    .map(c => (c?.text || "").trim())
-    .filter(Boolean);
-
-  const content = (textParts.join("\n")).trim();
+  // ★ データの取り出し方も標準的な形に修正
+  const content = data?.choices?.[0]?.message?.content?.trim();
 
   if (!content) {
-    console.error("Responses: empty content", JSON.stringify(data || {}));
-    return { ok: false, status: 500, text: "no_text_in_responses" };
+    console.error("OpenAI: empty content", JSON.stringify(data || {}));
+    return { ok: false, status: 500, text: "no_text_in_response" };
   }
   return { ok: true, content };
 }
+
 
 // ===== モデルを順に試す =====
 async function tryModels({ messages, max_tokens, temperature, response_format }) {
